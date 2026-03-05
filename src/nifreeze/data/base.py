@@ -27,16 +27,20 @@ from __future__ import annotations
 from collections import namedtuple
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import Any, Generic
+from typing import TYPE_CHECKING, Any, Generic
 from warnings import warn
 
 import attrs
 import h5py
 import nibabel as nb
 import numpy as np
+from nitransforms.linear import Affine as NTAffine
 from nitransforms.linear import LinearTransformsMapping
 from nitransforms.resampling import apply
 from typing_extensions import Self, TypeVarTuple, Unpack
+
+if TYPE_CHECKING:
+    from nifreeze.data.slicing import SliceAcquisition
 
 Ts = TypeVarTuple("Ts")
 
@@ -281,6 +285,25 @@ class BaseDataset(Generic[Unpack[Ts]]):
     datahdr: nb.Nifti1Header | None = attrs.field(default=None)
     """A :obj:`~nibabel.Nifti1Header` header corresponding to the data."""
 
+    slice_acquisition: SliceAcquisition | None = attrs.field(default=None)
+    """Slice acquisition metadata for slice-to-volume registration.
+
+    When set, enables per-excitation (slice-group) motion estimation.
+    ``None`` indicates volume-level-only processing (backward compatible).
+    """
+
+    slice_motion_affines: np.ndarray | None = attrs.field(
+        default=None, eq=attrs.cmp_using(eq=_cmp)
+    )
+    """Per-excitation motion affines with shape ``(N_vols, N_excitations, 4, 4)``.
+
+    Each entry stores the rigid-body deviation of a slice-group from the
+    volume-level transform stored in :attr:`motion_affines`.  The effective
+    transform for a given slice is::
+
+        T_eff = slice_motion_affines[vol, exc] @ motion_affines[vol]
+    """
+
     _filepath: Path = attrs.field(
         factory=lambda: Path(mkdtemp()) / "hmxfms_cache.h5",
         repr=False,
@@ -389,7 +412,14 @@ class BaseDataset(Generic[Unpack[Ts]]):
         """
         with h5py.File(filename, "r") as in_file:
             root = in_file["/0"]
-            data = {k: np.asanyarray(v) for k, v in root.items() if not k.startswith("_")}
+            data = {}
+            for k, v in root.items():
+                if k.startswith("_"):
+                    continue
+                if k == "slice_acquisition":
+                    data[k] = _read_slice_acquisition(v)
+                else:
+                    data[k] = np.asanyarray(v)
         return cls(**data)
 
     def get_filename(self) -> Path:
@@ -413,6 +443,44 @@ class BaseDataset(Generic[Unpack[Ts]]):
             self.motion_affines = np.repeat(np.eye(4)[None, ...], len(self), axis=0)
 
         self.motion_affines[index] = affine
+
+    def set_slice_transform(
+        self,
+        vol_index: int,
+        exc_index: int,
+        affine: np.ndarray,
+    ) -> None:
+        """
+        Set a per-excitation affine for a particular volume and excitation.
+
+        Parameters
+        ----------
+        vol_index : :obj:`int`
+            The volume index.
+        exc_index : :obj:`int`
+            The excitation (slice-group) index within the volume.
+        affine : :obj:`~numpy.ndarray`
+            The 4x4 affine matrix (deviation from the volume-level transform).
+
+        Raises
+        ------
+        :exc:`ValueError`
+            If :attr:`slice_acquisition` is not set.
+
+        """
+        if self.slice_acquisition is None:
+            raise ValueError(
+                "Cannot set per-excitation transforms without slice_acquisition metadata."
+            )
+
+        n_exc = self.slice_acquisition.n_excitations
+
+        if self.slice_motion_affines is None:
+            self.slice_motion_affines = np.repeat(
+                np.eye(4)[None, None, ...], len(self), axis=0
+            ).repeat(n_exc, axis=1)
+
+        self.slice_motion_affines[vol_index, exc_index] = affine
 
     def to_filename(
         self, filename: Path | str, compression: str | None = None, compression_opts: Any = None
@@ -446,13 +514,24 @@ class BaseDataset(Generic[Unpack[Ts]]):
                     continue
 
                 value = getattr(self, f.name)
-                if value is not None:
-                    root.create_dataset(
-                        f.name,
-                        data=value,
-                        compression=compression,
-                        compression_opts=compression_opts,
-                    )
+                if value is None:
+                    continue
+
+                # SliceAcquisition is stored as a sub-group with scalar attrs
+                if f.name == "slice_acquisition":
+                    _write_slice_acquisition(root, value)
+                    continue
+
+                # Skip non-array fields that h5py cannot serialize directly
+                if not isinstance(value, np.ndarray):
+                    continue
+
+                root.create_dataset(
+                    f.name,
+                    data=value,
+                    compression=compression,
+                    compression_opts=compression_opts,
+                )
 
     def to_nifti(
         self,
@@ -491,6 +570,71 @@ class BaseDataset(Generic[Unpack[Ts]]):
         )
 
 
+# -- HDF5 helpers for SliceAcquisition -----------------------------------------
+
+
+def _write_slice_acquisition(root: h5py.Group, sa: SliceAcquisition) -> None:
+    """Serialize a :class:`SliceAcquisition` into an HDF5 group."""
+    grp = root.create_group("slice_acquisition")
+    grp.attrs["n_slices"] = sa.n_slices
+    grp.attrs["multiband_factor"] = sa.multiband_factor
+    grp.attrs["slice_axis"] = sa.slice_axis
+    if sa.slice_order is not None:
+        grp.create_dataset("slice_order", data=sa.slice_order)
+
+
+def _read_slice_acquisition(grp: h5py.Group) -> SliceAcquisition:
+    """Reconstruct a :class:`SliceAcquisition` from an HDF5 group."""
+    from nifreeze.data.slicing import SliceAcquisition
+
+    kwargs: dict[str, Any] = {
+        "n_slices": int(grp.attrs["n_slices"]),
+        "multiband_factor": int(grp.attrs["multiband_factor"]),
+        "slice_axis": int(grp.attrs["slice_axis"]),
+    }
+    if "slice_order" in grp:
+        kwargs["slice_order"] = np.asanyarray(grp["slice_order"])
+    return SliceAcquisition(**kwargs)
+
+
+def _resample_s2v(
+    dataset: BaseDataset,
+    resampled: np.ndarray,
+    reference: ImageGrid,
+    order: int,
+) -> None:
+    """Resample volumes using per-excitation (S2V) transforms (in-place)."""
+    from nifreeze.utils.slicewise import compose_slice_transforms, reinsert_slices
+
+    sa = dataset.slice_acquisition
+    for i in range(len(dataset)):
+        per_slice_xfms = compose_slice_transforms(
+            dataset.motion_affines[i],
+            dataset.slice_motion_affines[i],
+            sa.excitation_groups,
+            sa.n_slices,
+        )
+        frame = dataset[i]
+        datamoving = nb.Nifti1Image(frame[0], dataset.affine, dataset.datahdr)
+        vol_resampled = np.zeros(
+            dataset.dataobj.shape[:3],
+            dtype=dataset.dataobj.dtype,
+        )
+        for slc_list in sa.excitation_groups:
+            xform = NTAffine(per_slice_xfms[slc_list[0]])
+            resampled_vol = np.asanyarray(
+                apply(xform, datamoving, order=order, reference=reference).dataobj,
+                dtype=dataset.dataobj.dtype,
+            )
+            reinsert_slices(
+                vol_resampled,
+                resampled_vol,
+                slc_list,
+                axis=sa.slice_axis,
+            )
+        resampled[..., i] = vol_resampled
+
+
 def to_nifti(
     dataset: BaseDataset,
     filename: Path | str | None = None,
@@ -526,27 +670,39 @@ def to_nifti(
         warn("write_hmxfms is set to True, but no filename was provided.", stacklevel=2)
         write_hmxfms = False
 
+    has_s2v = (
+        getattr(dataset, "slice_motion_affines", None) is not None
+        and getattr(dataset, "slice_acquisition", None) is not None
+    )
+
     if dataset.motion_affines is not None:  # resampling is needed
         reference = ImageGrid(shape=dataset.dataobj.shape[:3], affine=dataset.affine)
         resampled = np.empty_like(dataset.dataobj, dtype=dataset.dataobj.dtype)
-        xforms = LinearTransformsMapping(dataset.motion_affines, reference=reference)
 
-        # This loop could be replaced by nitransforms.resampling.apply() when
-        # it is fixed (bug should only affect datasets with less than 9 orientations)
-        for i, xform in enumerate(xforms):
-            frame = dataset[i]
-            datamoving = nb.Nifti1Image(frame[0], dataset.affine, dataset.datahdr)
-            # resample at index
-            resampled[..., i] = np.asanyarray(
-                apply(xform, datamoving, order=order).dataobj,
-                dtype=dataset.dataobj.dtype,
-            )
+        if has_s2v:
+            _resample_s2v(dataset, resampled, reference, order)
+        else:
+            xforms = LinearTransformsMapping(dataset.motion_affines, reference=reference)
 
-            if filename is not None and write_hmxfms:
-                # Prepare filename and write out
-                out_root = Path(filename).absolute()
-                out_root = out_root.parent / out_root.name.replace("".join(out_root.suffixes), "")
-                xform.to_filename(out_root.with_suffix(".x5"))
+            # This loop could be replaced by nitransforms.resampling.apply()
+            # when it is fixed (bug should only affect datasets with less than
+            # 9 orientations)
+            for i, xform in enumerate(xforms):
+                frame = dataset[i]
+                datamoving = nb.Nifti1Image(frame[0], dataset.affine, dataset.datahdr)
+                # resample at index
+                resampled[..., i] = np.asanyarray(
+                    apply(xform, datamoving, order=order).dataobj,
+                    dtype=dataset.dataobj.dtype,
+                )
+
+                if filename is not None and write_hmxfms:
+                    # Prepare filename and write out
+                    out_root = Path(filename).absolute()
+                    out_root = out_root.parent / out_root.name.replace(
+                        "".join(out_root.suffixes), ""
+                    )
+                    xform.to_filename(out_root.with_suffix(".x5"))
     else:
         resampled = dataset.dataobj
 

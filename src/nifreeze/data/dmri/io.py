@@ -50,6 +50,9 @@ def from_nii(
     bvec_file: Path | str | None = None,
     bval_file: Path | str | None = None,
     b0_file: Path | str | None = None,
+    multiband_factor: int | None = None,
+    slice_order: np.ndarray | None = None,
+    slice_axis: int = 2,
 ) -> DWI:
     """
     Load DWI data from NIfTI and construct a DWI object.
@@ -76,6 +79,16 @@ def from_nii(
     b0_file : :obj:`os.pathlike`, optional
         A NIfTI file containing a b=0 volume (possibly averaged or reference).
         If not provided, and the data contains at least one b=0 volume, one will be computed.
+    multiband_factor : :obj:`int`, optional
+        Simultaneous multi-slice (SMS / multiband) factor.  When provided,
+        a :class:`~nifreeze.data.slicing.SliceAcquisition` is attached to the
+        returned dataset, enabling slice-to-volume registration infrastructure.
+    slice_order : :obj:`~numpy.ndarray`, optional
+        1-D integer array giving the temporal order of excitations.
+        Length must equal ``n_slices // multiband_factor``.  ``None`` means
+        ascending order.
+    slice_axis : :obj:`int`, optional
+        Spatial axis of slice encoding (default ``2`` = Z).
 
     Returns
     -------
@@ -123,13 +136,27 @@ def from_nii(
         mask_img = load_api(brainmask_file, SpatialImage)
         brainmask_data = np.asanyarray(mask_img.dataobj, dtype=bool)
 
-    # 5) Create and return the DWI instance.
+    # 5) Build optional slice acquisition metadata
+    slice_acq = None
+    if multiband_factor is not None:
+        from nifreeze.data.slicing import SliceAcquisition
+
+        n_slices = fulldata.shape[slice_axis]
+        slice_acq = SliceAcquisition(
+            n_slices=n_slices,
+            multiband_factor=multiband_factor,
+            slice_order=slice_order,
+            slice_axis=slice_axis,
+        )
+
+    # 6) Create and return the DWI instance.
     return DWI(
         dataobj=fulldata,
         affine=img.affine,
         gradients=grad,
         bzero=b0_data,
         brainmask=brainmask_data,
+        slice_acquisition=slice_acq,
     )
 
 
