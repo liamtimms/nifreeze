@@ -44,7 +44,10 @@ from nifreeze.model.pet import BSplinePETModel
 from nifreeze.registration.ants import (
     Registration,
     _prepare_registration_data,
+    _prepare_svr_mask,
     _run_registration,
+    _run_slice_registration,
+    _to_nifti,
 )
 from nifreeze.utils import iterators
 
@@ -53,6 +56,7 @@ DatasetT = TypeVar("DatasetT", bound=BaseDataset)
 DEFAULT_CHUNK_SIZE: int = int(1e6)
 FIT_MSG = "Fit&predict"
 REG_MSG = "Realign"
+SVR_MSG = "SVR"
 
 
 class Filter:
@@ -97,6 +101,20 @@ class Estimator:
         self._model_kwargs = model_kwargs or {}
         self._align_kwargs = kwargs or {}
 
+    def _init_model(
+        self, dataset: BaseDataset, chunk_size: int
+    ) -> BaseModel:
+        """Instantiate or return the estimator's model."""
+        if isinstance(self._model, str):
+            if self._model.endswith("dti"):
+                self._model_kwargs["step"] = chunk_size
+            return ModelFactory.init(
+                model=self._model,
+                dataset=dataset,
+                **self._model_kwargs,
+            )
+        return self._model
+
     def run(self, dataset: DatasetT, **kwargs) -> Self:
         """
         Trigger execution of the workflow this estimator belongs.
@@ -123,33 +141,28 @@ class Estimator:
         num_voxels = dataset.brainmask.sum() if dataset.brainmask is not None else dataset.size3d
         chunk_size = DEFAULT_CHUNK_SIZE * (n_threads or 1)
 
-        # Prepare iterator
-        iterfunc = getattr(iterators, f"{self._strategy}_iterator")
-        index_iter = iterfunc(
-            size=len(dataset),
-            bvals=kwargs.pop("bvals", None),
-            uptake=kwargs.pop("uptake", None),
-            seed=kwargs.get("seed", None),
-            round_decimals=kwargs.pop("round_decimals", iterators.DEFAULT_ROUND_DECIMALS),
+        # SVR-specific parameters
+        n_iter = kwargs.pop("n_iter", 1)
+        s2v_niter = kwargs.pop("s2v_niter", 0)
+
+        # Determine whether SVR is possible (slice_acquisition must be set)
+        has_svr = (
+            s2v_niter > 0
+            and getattr(dataset, "slice_acquisition", None) is not None
         )
 
+        # Prepare iterator
+        iterfunc = getattr(iterators, f"{self._strategy}_iterator")
+        iter_kwargs = {
+            "size": len(dataset),
+            "bvals": kwargs.pop("bvals", None),
+            "uptake": kwargs.pop("uptake", None),
+            "seed": kwargs.get("seed", None),
+            "round_decimals": kwargs.pop("round_decimals", iterators.DEFAULT_ROUND_DECIMALS),
+        }
+
         # Initialize model
-        if isinstance(self._model, str):
-            if self._model.endswith("dti"):
-                self._model_kwargs["step"] = chunk_size
-
-            # Example: change model parameters only for DKI
-            # if self._model.endswith("dki"):
-            #     self._model_kwargs["fit_model"] = "CWLS"
-
-            # Factory creates the appropriate model and pipes arguments
-            model = ModelFactory.init(
-                model=self._model,
-                dataset=dataset,
-                **self._model_kwargs,
-            )
-        else:
-            model = self._model
+        model = self._init_model(dataset, chunk_size)
 
         # Prepare fit/predict keyword arguments
         fit_pred_kwargs = {
@@ -162,6 +175,12 @@ class Estimator:
         print(f"Dataset size: {num_voxels}x{len(dataset)}.")
         print(f"Parallel execution: {fit_pred_kwargs}.")
         print(f"Model: {model}.")
+        if has_svr:
+            sa = dataset.slice_acquisition
+            print(
+                f"SVR enabled: {sa.n_excitations} excitations/vol, "
+                f"MB{sa.multiband_factor}, {s2v_niter} inner iter(s)."
+            )
 
         if self._single_fit:
             print("Fitting 'single' model started ...")
@@ -173,56 +192,242 @@ class Estimator:
         kwargs = self._align_kwargs | kwargs
 
         dataset_length = len(dataset)
-        with TemporaryDirectory() as tmp_dir:
-            print(f"Processing in <{tmp_dir}>")
-            ptmp_dir = Path(tmp_dir)
 
-            bmask_path = None
-            if dataset.brainmask is not None:
-                bmask_path = ptmp_dir / "brainmask.nii.gz"
-                nb.Nifti1Image(
-                    dataset.brainmask.astype(np.uint8), dataset.affine, None
-                ).to_filename(bmask_path)
+        for outer_iter in range(n_iter):
+            if n_iter > 1:
+                print(f"--- Outer iteration {outer_iter + 1}/{n_iter} ---")
 
-            with tqdm(total=dataset_length, unit="vols.") as pbar:
-                # run an original-to-synthetic affine registration
-                for i in index_iter:
-                    pbar.set_description_str(f"{FIT_MSG: <16} vol. <{i}>")
+            # Re-generate the iterator for each outer pass
+            index_iter = iterfunc(**iter_kwargs)
 
-                    # fit the model
-                    predicted = model.fit_predict(  # type: ignore[union-attr]
-                        i,
-                        **fit_pred_kwargs,
-                    )
+            _run_lovo_pass(
+                dataset=dataset,
+                model=model,
+                index_iter=index_iter,
+                dataset_length=dataset_length,
+                fit_pred_kwargs=fit_pred_kwargs,
+                has_svr=has_svr,
+                s2v_niter=s2v_niter,
+                **kwargs,
+            )
 
-                    # prepare data for running ANTs
-                    predicted_path, volume_path, init_path = _prepare_registration_data(
-                        dataset[i][0],  # Access the target volume
+            # Between outer iterations: apply corrections so model trains on
+            # motion-corrected data with rotated gradients.
+            if outer_iter < n_iter - 1:
+                print("Applying corrections (resampling + gradient rotation)...")
+                dataset.apply_corrections()
+                # Re-init model so it picks up corrected dataset
+                model = self._init_model(dataset, chunk_size)
+
+        return self
+
+
+def _run_lovo_pass(
+    dataset: BaseDataset,
+    model: BaseModel,
+    index_iter,
+    dataset_length: int,
+    fit_pred_kwargs: dict,
+    has_svr: bool = False,
+    s2v_niter: int = 0,
+    **kwargs,
+) -> None:
+    """Execute one full LOVO pass (V2V + optional SVR) over all volumes."""
+    with TemporaryDirectory() as tmp_dir:
+        print(f"Processing in <{tmp_dir}>")
+        ptmp_dir = Path(tmp_dir)
+
+        bmask_path = None
+        if dataset.brainmask is not None:
+            bmask_path = ptmp_dir / "brainmask.nii.gz"
+            nb.Nifti1Image(
+                dataset.brainmask.astype(np.uint8), dataset.affine, None
+            ).to_filename(bmask_path)
+
+        with tqdm(total=dataset_length, unit="vols.") as pbar:
+            for i in index_iter:
+                pbar.set_description_str(f"{FIT_MSG: <16} vol. <{i}>")
+
+                # fit the model
+                predicted = model.fit_predict(  # type: ignore[union-attr]
+                    i,
+                    **fit_pred_kwargs,
+                )
+
+                # prepare data for running ANTs
+                predicted_path, volume_path, init_path = (
+                    _prepare_registration_data(
+                        dataset[i][0],
                         predicted,
                         dataset.affine,
                         i,
                         ptmp_dir,
                         kwargs.pop("clip", "both"),
                     )
+                )
 
-                    pbar.set_description_str(f"{REG_MSG: <16} vol. <{i}>")
+                pbar.set_description_str(f"{REG_MSG: <16} vol. <{i}>")
 
-                    xform = _run_registration(
-                        predicted_path,
-                        volume_path,
-                        i,
-                        ptmp_dir,
-                        init_affine=init_path,
-                        fixedmask_path=bmask_path,
-                        output_transform_prefix=f"ants-{i:05d}",
+                xform = _run_registration(
+                    predicted_path,
+                    volume_path,
+                    i,
+                    ptmp_dir,
+                    init_affine=init_path,
+                    fixedmask_path=bmask_path,
+                    output_transform_prefix=f"ants-{i:05d}",
+                    **kwargs,
+                )
+
+                dataset.set_transform(i, xform.matrix)
+
+                # ---- SVR inner loop ----
+                if has_svr:
+                    _run_svr_loop(
+                        dataset=dataset,
+                        model=model,
+                        vol_idx=i,
+                        predicted_path=predicted_path,
+                        volume_path=volume_path,
+                        bmask_path=bmask_path,
+                        dirname=ptmp_dir,
+                        s2v_niter=s2v_niter,
+                        pbar=pbar,
                         **kwargs,
                     )
 
-                    # update
-                    dataset.set_transform(i, xform.matrix)
-                    pbar.update()
+                pbar.update()
 
-        return self
+
+def _run_svr_loop(
+    dataset: BaseDataset,
+    model: BaseModel,
+    vol_idx: int,
+    predicted_path: Path,
+    volume_path: Path,
+    bmask_path: Path | None,
+    dirname: Path,
+    s2v_niter: int = 1,
+    pbar: tqdm | None = None,
+    **kwargs,
+) -> None:
+    """
+    Run the slice-to-volume (SVR) inner loop for a single volume.
+
+    For each excitation group within the volume, a per-excitation predicted
+    volume is synthesised at the effective (rotated) gradient direction, and
+    the excitation's slices are registered to the prediction using dual masks
+    (brain mask on the fixed image, slice mask on the moving image).
+
+    Parameters
+    ----------
+    dataset : :obj:`~nifreeze.data.base.BaseDataset`
+        The dataset (must have ``slice_acquisition`` set).
+    model : :obj:`~nifreeze.model.base.BaseModel`
+        The **already-fitted** model (after :meth:`fit_predict` for this volume).
+    vol_idx : :obj:`int`
+        Index of the volume being processed.
+    predicted_path : :obj:`~pathlib.Path`
+        Path to the V2V-level predicted NIfTI (used as fallback if the model
+        does not support :meth:`predict_at`).
+    volume_path : :obj:`~pathlib.Path`
+        Path to the actual (moving) volume NIfTI.
+    bmask_path : :obj:`~pathlib.Path` or ``None``
+        Path to the brain mask NIfTI (fixed mask).
+    dirname : :obj:`~pathlib.Path`
+        Working directory for ANTs outputs.
+    s2v_niter : :obj:`int`
+        Number of SVR inner iterations.
+    pbar : :obj:`~tqdm.tqdm` or ``None``
+        Progress bar for status updates.
+    **kwargs
+        Forwarded to :func:`_run_slice_registration` (seed, num_threads, …).
+
+    """
+    sa = dataset.slice_acquisition
+    exc_groups = sa.excitation_groups
+    t_order = sa.temporal_order()
+    v2v_xform = dataset.motion_affines[vol_idx]
+
+    # Check whether the model supports predict_at (DWI models do)
+    has_predict_at = hasattr(model, "predict_at") and callable(
+        getattr(model, "predict_at", None)
+    )
+    # DWI datasets carry gradient information
+    has_gradients = hasattr(dataset, "gradients") and dataset.gradients is not None
+
+    for _s2v_it in range(s2v_niter):
+        for exc_idx in t_order:
+            if pbar is not None:
+                pbar.set_description_str(
+                    f"{SVR_MSG: <16} vol.<{vol_idx}> exc.<{exc_idx}>"
+                )
+
+            slice_indices = exc_groups[exc_idx]
+
+            # --- 1. Compute per-excitation predicted volume ---
+            exc_predicted_path = predicted_path  # fallback: V2V prediction
+
+            if has_predict_at and has_gradients:
+                # Compose S2V × V2V to get effective rotation for this excitation
+                if dataset.slice_motion_affines is not None:
+                    s2v_xfm = dataset.slice_motion_affines[vol_idx, exc_idx]
+                    composed_xfm = s2v_xfm @ v2v_xform
+                else:
+                    composed_xfm = v2v_xform
+
+                from nifreeze.data.dmri.utils import transform_fsl_bvec
+
+                rotated_bvec = transform_fsl_bvec(
+                    dataset.gradients[vol_idx, :3],
+                    composed_xfm,
+                    dataset.affine,
+                    invert=True,
+                )
+                rotated_gradient = np.append(
+                    rotated_bvec, dataset.gradients[vol_idx, -1]
+                )
+
+                # Predict at the excitation's effective gradient direction
+                predicted_exc = model.predict_at(rotated_gradient)
+
+                exc_predicted_path = (
+                    dirname
+                    / f"predicted_v{vol_idx:05d}_e{exc_idx:03d}.nii.gz"
+                )
+                _to_nifti(
+                    predicted_exc,
+                    dataset.affine,
+                    exc_predicted_path,
+                    clip=True,
+                )
+
+            # --- 2. Create moving-space slice mask ---
+            slicemask_path = _prepare_svr_mask(
+                dataset.dataobj.shape[:3],
+                dataset.affine,
+                slice_indices,
+                exc_idx,
+                vol_idx,
+                dirname,
+                axis=sa.slice_axis,
+            )
+
+            # --- 3. Register ---
+            exc_xform = _run_slice_registration(
+                exc_predicted_path,
+                volume_path,
+                vol_idx=vol_idx,
+                exc_idx=exc_idx,
+                dirname=dirname,
+                fixedmask_path=bmask_path,
+                movingmask_path=slicemask_path,
+                excitation_time=None,  # reserved for future temporal prediction
+                **kwargs,
+            )
+
+            # --- 4. Store per-excitation transform ---
+            dataset.set_slice_transform(vol_idx, exc_idx, exc_xform.matrix)
 
 
 class PETMotionEstimator:

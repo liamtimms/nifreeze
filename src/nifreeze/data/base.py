@@ -482,6 +482,59 @@ class BaseDataset(Generic[Unpack[Ts]]):
 
         self.slice_motion_affines[vol_index, exc_index] = affine
 
+    def apply_corrections(self, order: int = 3) -> None:
+        """
+        Resample ``dataobj`` in-place using the current motion transforms.
+
+        After resampling, the ``motion_affines`` (and ``slice_motion_affines``,
+        if present) are reset to identity matrices so that subsequent model
+        fitting operates on corrected data.
+
+        This is intended to be called **between outer iterations** of the
+        estimator so that models are trained on motion-corrected data with
+        appropriately rotated gradient directions (for DWI subclasses).
+
+        Parameters
+        ----------
+        order : :obj:`int`, optional
+            The interpolation order to use when resampling the data.
+            Defaults to 3 (cubic interpolation).
+
+        """
+        if self.motion_affines is None:
+            return
+
+        reference = ImageGrid(shape=self.dataobj.shape[:3], affine=self.affine)
+
+        has_s2v = (
+            getattr(self, "slice_motion_affines", None) is not None
+            and getattr(self, "slice_acquisition", None) is not None
+        )
+
+        resampled = np.empty_like(self.dataobj, dtype=self.dataobj.dtype)
+
+        if has_s2v:
+            _resample_s2v(self, resampled, reference, order)
+        else:
+            xforms = LinearTransformsMapping(self.motion_affines, reference=reference)
+            for i, xform in enumerate(xforms):
+                frame = self[i]
+                datamoving = nb.Nifti1Image(frame[0], self.affine, self.datahdr)
+                resampled[..., i] = np.asanyarray(
+                    apply(xform, datamoving, order=order).dataobj,
+                    dtype=self.dataobj.dtype,
+                )
+
+        # Update data in-place and reset transforms to identity
+        self.dataobj = resampled
+        self.motion_affines = np.repeat(np.eye(4)[None, ...], len(self), axis=0)
+
+        if has_s2v:
+            n_exc = self.slice_acquisition.n_excitations
+            self.slice_motion_affines = np.repeat(
+                np.eye(4)[None, None, ...], len(self), axis=0
+            ).repeat(n_exc, axis=1)
+
     def to_filename(
         self, filename: Path | str, compression: str | None = None, compression_opts: Any = None
     ) -> None:

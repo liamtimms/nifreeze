@@ -505,3 +505,100 @@ def _run_registration(
     )
 
     return xform
+
+
+def _prepare_svr_mask(
+    shape: tuple[int, ...],
+    affine: np.ndarray,
+    slice_indices: list[int],
+    exc_idx: int,
+    vol_idx: int,
+    dirname: Path,
+    axis: int = 2,
+) -> Path:
+    """
+    Create a NIfTI slice mask for one excitation group (moving mask for SVR).
+
+    The mask volume has the same *shape* and *affine* as the moving image and
+    is set to ``1`` only at the slices belonging to the given excitation.
+
+    Parameters
+    ----------
+    shape : :obj:`tuple` of :obj:`int`
+        Spatial shape of the 3-D volume (X, Y, Z).
+    affine : :obj:`~numpy.ndarray`
+        The image affine.
+    slice_indices : :obj:`list` of :obj:`int`
+        Physical slice indices acquired during this excitation.
+    exc_idx : :obj:`int`
+        Excitation index (used for file naming).
+    vol_idx : :obj:`int`
+        Volume index (used for file naming).
+    dirname : :obj:`~pathlib.Path`
+        Directory in which to write the mask file.
+    axis : :obj:`int`
+        Slice-encoding axis (default ``2``).
+
+    Returns
+    -------
+    :obj:`~pathlib.Path`
+        Path to the saved NIfTI slice mask.
+
+    """
+    from nifreeze.utils.slicewise import slice_mask
+
+    mask_data = slice_mask(shape, slice_indices, axis=axis)
+    mask_path = dirname / f"slicemask_v{vol_idx:05d}_e{exc_idx:03d}.nii.gz"
+    _to_nifti(mask_data, affine, mask_path, clip=False)
+    return mask_path
+
+
+def _run_slice_registration(
+    fixed_path: str | Path,
+    moving_path: str | Path,
+    vol_idx: int,
+    exc_idx: int,
+    dirname: Path,
+    excitation_time: float | None = None,
+    **kwargs,
+) -> nt.base.BaseTransform:
+    """
+    Register one excitation's slices of the moving image to the predicted (fixed).
+
+    This is a thin wrapper around :func:`_run_registration` that selects the
+    SVR-specific ANTs configuration and constructs an output prefix that
+    encodes both volume and excitation indices.
+
+    Parameters
+    ----------
+    fixed_path : :obj:`~pathlib.Path`
+        Fixed (predicted) image filename.
+    moving_path : :obj:`~pathlib.Path`
+        Moving (actual) image filename.
+    vol_idx : :obj:`int`
+        Dataset volume index.
+    exc_idx : :obj:`int`
+        Excitation (slice-group) index within the volume.
+    dirname : :obj:`~pathlib.Path`
+        Working directory for ANTs outputs.
+    excitation_time : :obj:`float`, optional
+        Acquisition time of this excitation within the volume (seconds).
+        Currently unused — reserved for future temporal motion prediction.
+    **kwargs
+        Forwarded to :func:`_run_registration` (masks, init, seed, …).
+
+    Returns
+    -------
+    xform : :obj:`~nitransforms.base.BaseTransform`
+        Registration transformation for this excitation.
+
+    """
+    kwargs.setdefault("ants_config", "svr-rigid_level0")
+    kwargs["output_transform_prefix"] = f"ants-v{vol_idx:05d}-e{exc_idx:03d}"
+    return _run_registration(
+        fixed_path=fixed_path,
+        moving_path=moving_path,
+        vol_idx=vol_idx,
+        dirname=dirname,
+        **kwargs,
+    )

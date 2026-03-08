@@ -185,8 +185,40 @@ class DWI(BaseDataset[np.ndarray]):
                 f"orientations; found {self.dataobj.shape[-1]}."
             )
 
+    @property
+    def corrected_gradients(self) -> np.ndarray:
+        """Return gradients with b-vectors rotated by current ``motion_affines``.
+
+        If ``motion_affines`` is ``None``, the original gradients are returned
+        unchanged.  Only the volume-level rotation (V2V) is applied; per-excitation
+        (S2V) rotations are not folded in because the gradient direction is defined
+        per-volume, not per-slice.
+
+        Returns
+        -------
+        :obj:`~numpy.ndarray`
+            A copy of the gradient table with shape ``(N, 4)`` where the first
+            three columns of each row have been rotated by the corresponding
+            volume-level motion affine.
+
+        """
+        if self.motion_affines is None:
+            return self.gradients
+
+        from nifreeze.data.dmri.utils import transform_fsl_bvec
+
+        rotated = self.gradients.copy()
+        for i in range(len(self)):
+            rotated[i, :3] = transform_fsl_bvec(
+                self.gradients[i, :3],
+                self.motion_affines[i],
+                self.affine,
+                invert=True,
+            )
+        return rotated
+
     def _getextra(self, idx: int | slice | tuple | np.ndarray) -> tuple[np.ndarray]:
-        return (self.gradients[idx, ...],)
+        return (self.corrected_gradients[idx, ...],)
 
     # For the sake of the docstring
     def __getitem__(

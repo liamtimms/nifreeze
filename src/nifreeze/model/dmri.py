@@ -341,7 +341,7 @@ class BaseDWIModel(BaseModel):
         """
 
         kwargs.pop("omp_nthreads", None)  # Drop omp_nthreads
-        n_models = self._fit(
+        self._fit(
             index,
             n_jobs=kwargs.pop("n_jobs", None),
             **kwargs,
@@ -351,6 +351,32 @@ class BaseDWIModel(BaseModel):
             return None
 
         gradient = self._dataset.gradients[index, :]
+        return self.predict_at(gradient, **kwargs)
+
+    def predict_at(self, gradient: np.ndarray, **kwargs) -> np.ndarray:
+        """
+        Predict the diffusion signal at an arbitrary gradient direction.
+
+        Uses the model fitted by the most recent call to :meth:`fit_predict` or
+        :meth:`_fit`.  Does **not** re-fit the model.
+
+        Parameters
+        ----------
+        gradient : :obj:`~numpy.ndarray`
+            A 4-element array ``[gx, gy, gz, bval]`` in nifreeze format
+            (the first three elements are the b-vector components, the last
+            element is the b-value).
+
+        Returns
+        -------
+        :obj:`~numpy.ndarray`
+            Predicted 3D volume at the given gradient direction.
+
+        """
+        if not self._models:
+            raise RuntimeError(
+                "Model has not been fitted yet. Call fit_predict() first."
+            )
 
         model_str = getattr(self, "_model_class", "")
         if "dipy" in model_str or "GeneralizedQSamplingModel" in model_str:
@@ -358,6 +384,7 @@ class BaseDWIModel(BaseModel):
                 gradient[np.newaxis, -1], gradient[np.newaxis, :-1]
             )
 
+        n_models = len(self._models)
         if n_models == 1:
             predicted, _ = _exec_predict(
                 self._models[0], **(kwargs | {"gtab": gradient, "S0": self._S0})
