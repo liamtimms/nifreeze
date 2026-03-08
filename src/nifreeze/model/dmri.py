@@ -52,7 +52,19 @@ def _exec_fit(model, data, chunk=None, **kwargs):
 
 def _exec_predict(model, chunk=None, **kwargs):
     """Propagate model parameters and call predict."""
-    return np.squeeze(model.predict(**kwargs)), chunk
+    return_std = kwargs.pop("return_std", False)
+
+    # Only pass return_std to models that support it (e.g., GPFit)
+    import inspect
+
+    sig = inspect.signature(model.predict)
+    if return_std and "return_std" in sig.parameters:
+        kwargs["return_std"] = True
+
+    result = model.predict(**kwargs)
+    if isinstance(result, tuple):
+        return (np.squeeze(result[0]), np.squeeze(result[1])), chunk
+    return np.squeeze(result), chunk
 
 
 def _compute_data_mask(
@@ -353,7 +365,9 @@ class BaseDWIModel(BaseModel):
         gradient = self._dataset.gradients[index, :]
         return self.predict_at(gradient, **kwargs)
 
-    def predict_at(self, gradient: np.ndarray, **kwargs) -> np.ndarray:
+    def predict_at(
+        self, gradient: np.ndarray, return_std: bool = False, **kwargs,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """
         Predict the diffusion signal at an arbitrary gradient direction.
 
@@ -366,11 +380,15 @@ class BaseDWIModel(BaseModel):
             A 4-element array ``[gx, gy, gz, bval]`` in nifreeze format
             (the first three elements are the b-vector components, the last
             element is the b-value).
+        return_std : :obj:`bool`, optional
+            If ``True``, also return the per-voxel standard deviation of the
+            prediction (only supported by GP models).
 
         Returns
         -------
-        :obj:`~numpy.ndarray`
-            Predicted 3D volume at the given gradient direction.
+        :obj:`~numpy.ndarray` or :obj:`tuple`
+            Predicted 3D volume, or ``(mean, std)`` if *return_std* is
+            ``True``.
 
         """
         if not self._models:
@@ -384,32 +402,50 @@ class BaseDWIModel(BaseModel):
                 gradient[np.newaxis, -1], gradient[np.newaxis, :-1]
             )
 
+        pred_kwargs = kwargs | {
+            "gtab": gradient, "S0": self._S0, "return_std": return_std,
+        }
+
         n_models = len(self._models)
         if n_models == 1:
-            predicted, _ = _exec_predict(
-                self._models[0], **(kwargs | {"gtab": gradient, "S0": self._S0})
-            )
+            raw, _ = _exec_predict(self._models[0], **pred_kwargs)
         else:
-            predicted = [None] * n_models
+            raw_parts = [None] * n_models
             S0 = np.array_split(self._S0, n_models)
 
-            # Parallelize process with joblib
             with Parallel(n_jobs=n_models) as executor:
                 results = executor(
                     delayed(_exec_predict)(
                         model,
                         chunk=i,
-                        **(kwargs | {"gtab": gradient, "S0": S0[i]}),
+                        **(kwargs | {
+                            "gtab": gradient, "S0": S0[i],
+                            "return_std": return_std,
+                        }),
                     )
                     for i, model in enumerate(self._models)
                 )
-            for subprediction, rindex in results:
-                predicted[rindex] = subprediction
+            for subresult, rindex in results:
+                raw_parts[rindex] = subresult
 
-            predicted = np.hstack(predicted)
+            if return_std and isinstance(raw_parts[0], tuple):
+                raw = (
+                    np.hstack([p[0] for p in raw_parts]),
+                    np.hstack([p[1] for p in raw_parts]),
+                )
+            else:
+                raw = np.hstack(raw_parts)
 
-        retval = np.zeros_like(self._data_mask, dtype=self._dataset.dataobj.dtype)
-        retval[self._data_mask, ...] = predicted
+        dtype = self._dataset.dataobj.dtype
+        if return_std and isinstance(raw, tuple):
+            retval_mean = np.zeros_like(self._data_mask, dtype=dtype)
+            retval_std = np.zeros_like(self._data_mask, dtype=dtype)
+            retval_mean[self._data_mask, ...] = raw[0]
+            retval_std[self._data_mask, ...] = raw[1]
+            return retval_mean, retval_std
+
+        retval = np.zeros_like(self._data_mask, dtype=dtype)
+        retval[self._data_mask, ...] = raw
         return retval
 
 

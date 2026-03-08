@@ -292,6 +292,16 @@ class BaseDataset(Generic[Unpack[Ts]]):
     ``None`` indicates volume-level-only processing (backward compatible).
     """
 
+    outlier_map: np.ndarray | None = attrs.field(
+        default=None, repr=_data_repr, eq=attrs.cmp_using(eq=_cmp)
+    )
+    """Binary outlier flags, shape ``(n_slices, n_volumes)``."""
+
+    outlier_nstdev_map: np.ndarray | None = attrs.field(
+        default=None, repr=_data_repr, eq=attrs.cmp_using(eq=_cmp)
+    )
+    """Per-slice deviation magnitudes, shape ``(n_slices, n_volumes)``."""
+
     slice_motion_affines: np.ndarray | None = attrs.field(
         default=None, eq=attrs.cmp_using(eq=_cmp)
     )

@@ -37,6 +37,11 @@ import numpy as np
 from tqdm import tqdm
 from typing_extensions import Self
 
+from nifreeze.analysis.outliers import (
+    OutlierConfig,
+    detect_outlier_slices,
+    replace_outlier_slices,
+)
 from nifreeze.data.base import BaseDataset
 from nifreeze.data.pet import PET
 from nifreeze.model.base import BaseModel, ModelFactory
@@ -83,7 +88,10 @@ class Filter:
 class Estimator:
     """Orchestrates components for a single estimation step."""
 
-    __slots__ = ("_model", "_single_fit", "_strategy", "_prev", "_model_kwargs", "_align_kwargs")
+    __slots__ = (
+        "_model", "_single_fit", "_strategy", "_prev",
+        "_model_kwargs", "_align_kwargs", "_outlier_config",
+    )
 
     def __init__(
         self,
@@ -92,6 +100,7 @@ class Estimator:
         prev: Estimator | Filter | None = None,
         model_kwargs: dict | None = None,
         single_fit: bool = False,
+        outlier_config: OutlierConfig | None = None,
         **kwargs,
     ):
         self._model = model
@@ -100,6 +109,7 @@ class Estimator:
         self._single_fit = single_fit
         self._model_kwargs = model_kwargs or {}
         self._align_kwargs = kwargs or {}
+        self._outlier_config = outlier_config
 
     def _init_model(
         self, dataset: BaseDataset, chunk_size: int
@@ -182,6 +192,21 @@ class Estimator:
                 f"MB{sa.multiband_factor}, {s2v_niter} inner iter(s)."
             )
 
+        # Initialize outlier maps if detection is enabled
+        ol_config = self._outlier_config
+        if ol_config is not None and ol_config.enabled:
+            n_slices = dataset.dataobj.shape[ol_config.slice_axis]
+            dataset.outlier_map = np.zeros(
+                (n_slices, len(dataset)), dtype=bool,
+            )
+            dataset.outlier_nstdev_map = np.zeros(
+                (n_slices, len(dataset)), dtype=np.float64,
+            )
+            print(
+                f"Outlier detection enabled: nstd={ol_config.nstd}, "
+                f"nvox={ol_config.nvox}."
+            )
+
         if self._single_fit:
             print("Fitting 'single' model started ...")
             start = timer()
@@ -208,6 +233,7 @@ class Estimator:
                 fit_pred_kwargs=fit_pred_kwargs,
                 has_svr=has_svr,
                 s2v_niter=s2v_niter,
+                outlier_config=ol_config,
                 **kwargs,
             )
 
@@ -230,6 +256,7 @@ def _run_lovo_pass(
     fit_pred_kwargs: dict,
     has_svr: bool = False,
     s2v_niter: int = 0,
+    outlier_config: OutlierConfig | None = None,
     **kwargs,
 ) -> None:
     """Execute one full LOVO pass (V2V + optional SVR) over all volumes."""
@@ -253,6 +280,25 @@ def _run_lovo_pass(
                     i,
                     **fit_pred_kwargs,
                 )
+
+                # Outlier detection and replacement (before registration)
+                if (
+                    outlier_config is not None
+                    and outlier_config.enabled
+                    and predicted is not None
+                ):
+                    observed_vol = dataset[i][0]
+                    ol_mask, ol_nstd = detect_outlier_slices(
+                        observed_vol, predicted, dataset.brainmask,
+                        outlier_config,
+                    )
+                    dataset.outlier_map[:, i] = ol_mask
+                    dataset.outlier_nstdev_map[:, i] = ol_nstd
+                    if ol_mask.any():
+                        dataset.dataobj[..., i] = replace_outlier_slices(
+                            observed_vol, predicted, ol_mask,
+                            slice_axis=outlier_config.slice_axis,
+                        )
 
                 # prepare data for running ANTs
                 predicted_path, volume_path, init_path = (

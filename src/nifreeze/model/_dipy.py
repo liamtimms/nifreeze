@@ -55,7 +55,7 @@ def gp_prediction(
     gtab: GradientTable | np.ndarray,
     mask: np.ndarray | None = None,
     return_std: bool = False,
-) -> np.ndarray:
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Predicts one or more DWI orientations given a model.
 
@@ -90,9 +90,13 @@ def gp_prediction(
         raise RuntimeError("Model is not yet fitted.")
 
     # Extract orientations from bvecs, and highly likely, the b-value too.
-    orientations = model.predict(X, return_std=return_std)
-    assert isinstance(orientations, np.ndarray)
-    return orientations
+    result = model.predict(X, return_std=return_std)
+    if return_std:
+        # sklearn returns (y_mean, y_std) when return_std=True
+        assert isinstance(result, tuple)
+        return result
+    assert isinstance(result, np.ndarray)
+    return result
 
 
 class GaussianProcessModel(ReconstModel):
@@ -266,7 +270,8 @@ class GPFit:
     def predict(
         self,
         gtab: GradientTable | np.ndarray,
-    ) -> np.ndarray:
+        return_std: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """
         Generate DWI signal based on a fitted Gaussian Process.
 
@@ -274,11 +279,16 @@ class GPFit:
         ----------
         gtab : :obj:`~dipy.core.gradients.GradientTable` or :obj:`~np.ndarray`
             Gradient table with one or more orientations at which the GP will be evaluated.
+        return_std : :obj:`bool`, optional
+            Whether to return the standard deviation of the predicted signal.
 
         Returns
         -------
-        :obj:`~numpy.ndarray`
-            A 3D or 4D array with the simulated gradient(s).
+        :obj:`~numpy.ndarray` or :obj:`tuple`
+            A 3D or 4D array with the simulated gradient(s), or a tuple
+            ``(mean, std)`` if *return_std* is ``True``.
 
         """
-        return gp_prediction(self.model, gtab, mask=self.mask)
+        return gp_prediction(
+            self.model, gtab, mask=self.mask, return_std=return_std,
+        )

@@ -151,6 +151,37 @@ def _build_parser() -> ArgumentParser:
         help="Ignore the low-b reference and use the robust signal maximum",
     )
 
+    g_outlier = parser.add_argument_group("Outlier detection options")
+    g_outlier.add_argument(
+        "--repol",
+        action="store_true",
+        help="Enable outlier slice replacement (EDDY-style --repol).",
+    )
+    g_outlier.add_argument(
+        "--ol-nstd",
+        action="store",
+        type=float,
+        default=4.0,
+        help="Number of standard deviations for outlier detection threshold.",
+    )
+    g_outlier.add_argument(
+        "--ol-nvox",
+        action="store",
+        type=int,
+        default=250,
+        help="Minimum number of brain voxels per slice for outlier consideration.",
+    )
+    g_outlier.add_argument(
+        "--ol-pos",
+        action="store_true",
+        help="Also detect positive outliers (signal increase).",
+    )
+    g_outlier.add_argument(
+        "--ol-sqr",
+        action="store_true",
+        help="Also detect outliers using squared residuals.",
+    )
+
     g_pet = parser.add_argument_group("Options for PET inputs")
     g_pet.add_argument(
         "--timing-file",
@@ -253,6 +284,17 @@ def parse_args(argv: list[str] | None = None) -> tuple[Namespace, dict, dict, di
         model_kwargs["ignore_bzero"] = True
 
     estimator_kwargs = {}
+
+    if args.repol:
+        from nifreeze.analysis.outliers import OutlierConfig
+
+        estimator_kwargs["outlier_config"] = OutlierConfig(
+            enabled=True,
+            nstd=args.ol_nstd,
+            nvox=args.ol_nvox,
+            detect_positive=args.ol_pos,
+            detect_squared=args.ol_sqr,
+        )
 
     for idx, _model in enumerate(args.models):
         single_fit = _determine_single_fit_mode(_model)
