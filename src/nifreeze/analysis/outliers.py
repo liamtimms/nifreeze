@@ -156,8 +156,10 @@ def detect_outlier_slices(
         Boolean array of shape ``(n_slices,)``.  ``True`` marks an outlier.
     nstdev_values : :obj:`~numpy.ndarray`
         Number of standard deviations each slice departs from the mean,
-        shape ``(n_slices,)``.  Positive values indicate signal *below*
-        prediction (dropout).
+        shape ``(n_slices,)``.  When only negative-outlier detection is
+        active, positive values indicate signal *below* prediction
+        (dropout).  When ``detect_squared`` is enabled, values are
+        absolute magnitudes.
 
     """
     mean_res, n_vox = compute_slice_residuals(
@@ -196,10 +198,10 @@ def detect_outlier_slices(
             observed, predicted, brainmask, config, valid,
         )
         outlier_mask |= sq_mask
-        # Keep the larger deviation magnitude
-        nstdev_values = np.where(
-            np.abs(sq_nstd) > np.abs(nstdev_values), sq_nstd, nstdev_values,
-        )
+        # Keep the larger absolute deviation for reporting
+        abs_sq = np.abs(sq_nstd)
+        abs_main = np.abs(nstdev_values)
+        nstdev_values = np.where(abs_sq > abs_main, abs_sq, abs_main)
 
     return outlier_mask, nstdev_values
 

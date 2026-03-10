@@ -353,6 +353,7 @@ class BaseDWIModel(BaseModel):
         """
 
         kwargs.pop("omp_nthreads", None)  # Drop omp_nthreads
+        return_std = kwargs.pop("return_std", False)
         self._fit(
             index,
             n_jobs=kwargs.pop("n_jobs", None),
@@ -363,7 +364,7 @@ class BaseDWIModel(BaseModel):
             return None
 
         gradient = self._dataset.gradients[index, :]
-        return self.predict_at(gradient, **kwargs)
+        return self.predict_at(gradient, return_std=return_std, **kwargs)
 
     def predict_at(
         self, gradient: np.ndarray, return_std: bool = False, **kwargs,
@@ -439,7 +440,8 @@ class BaseDWIModel(BaseModel):
         dtype = self._dataset.dataobj.dtype
         if return_std and isinstance(raw, tuple):
             retval_mean = np.zeros_like(self._data_mask, dtype=dtype)
-            retval_std = np.zeros_like(self._data_mask, dtype=dtype)
+            # Std must be float to preserve sub-unit precision
+            retval_std = np.zeros(self._data_mask.shape, dtype=np.float32)
             retval_mean[self._data_mask, ...] = raw[0]
             retval_std[self._data_mask, ...] = raw[1]
             return retval_mean, retval_std

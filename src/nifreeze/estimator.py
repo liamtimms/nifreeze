@@ -308,7 +308,7 @@ def _run_lovo_pass(
                         dataset.affine,
                         i,
                         ptmp_dir,
-                        kwargs.pop("clip", "both"),
+                        kwargs.get("clip", "both"),
                     )
                 )
 
